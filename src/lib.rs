@@ -233,37 +233,87 @@ pub fn from_json(py: Python, json: Value) -> Result<PyObject, JsonError> {
         }
     }
 
-    match json {
-        Value::Number(x) => {
-            if let Some(n) = x.as_u64() {
-                obj!(n)
-            } else if let Some(n) = x.as_i64() {
-                obj!(n)
-            } else if let Some(n) = x.as_f64() {
-                obj!(n)
-            } else {
-                // We should never get to this point
-                Err(JsonError::ImpossibleNumber)
+    // Iterative traversal with a pre-traversal phase that enqueues children,
+    // and post-traversal that converts the nodes.
+
+    enum Phase { Pre, Post }
+    enum Parent { Array, Map(String) }
+
+    let mut stack = vec![(json, Phase::Pre, Parent::Array)];
+    let mut vec_accum = vec![vec![]];
+    let mut map_accum = vec![];
+
+    while let Some((json, phase, parent)) = stack.pop() {
+        match phase {
+            Phase::Pre => {
+                match json {
+                    Value::Array(vec) => {
+                        vec_accum.push(vec![]);
+                        for item in vec.into_iter().rev() {
+                            stack.push((item, Phase::Pre, Parent::Array));
+                        }
+                    }
+                    Value::Object(map) => {
+                        map_accum.push(vec![]);
+                        for (key, value) in map.into_iter().rev() {
+                            stack.push((value, Phase::Pre, Parent::Map(key)))
+                        }
+                    }
+                    json => {
+                        stack.push((json, Phase::Post, parent));
+                    }
+                }
+            }
+            Phase::Post => {
+                let pyval = match json {
+                    Value::Number(x) => {
+                        if let Some(n) = x.as_u64() {
+                            obj!(n)
+                        } else if let Some(n) = x.as_i64() {
+                            obj!(n)
+                        } else if let Some(n) = x.as_f64() {
+                            obj!(n)
+                        } else {
+                            // We should never get to this point
+                            Err(JsonError::ImpossibleNumber)
+                        }
+                    }
+                    Value::String(x) => Ok(PyUnicode::new(py, &x).into_object()),
+                    Value::Bool(x) => obj!(x),
+                    Value::Array(vec) => {
+                        let mut elements = Vec::new();
+                        for item in vec {
+                            elements.push(from_json(py, item)?);
+                        }
+                        Ok(PyList::new(py, &elements[..]).into_object())
+                    }
+                    Value::Object(map) => {
+                        let dict = PyDict::new(py);
+                        for (key, value) in map {
+                            dict.set_item(py, key, from_json(py, value)?)?;
+                        }
+                        Ok(dict.into_object())
+                    }
+                    Value::Null => Ok(py.None()),
+                };
+                match parent {
+                    Parent::Array => {
+                        vec_accum.last_mut().expect("py vec accumulator").push(pyval);
+                    }
+                    Parent::Map(key) => {
+                        map_accum.last_mut().expect("py map accumulator").push((key, pyval));
+                    }
+                }
             }
         }
-        Value::String(x) => Ok(PyUnicode::new(py, &x).into_object()),
-        Value::Bool(x) => obj!(x),
-        Value::Array(vec) => {
-            let mut elements = Vec::new();
-            for item in vec {
-                elements.push(from_json(py, item)?);
-            }
-            Ok(PyList::new(py, &elements[..]).into_object())
-        }
-        Value::Object(map) => {
-            let dict = PyDict::new(py);
-            for (key, value) in map {
-                dict.set_item(py, key, from_json(py, value)?)?;
-            }
-            Ok(dict.into_object())
-        }
-        Value::Null => Ok(py.None()),
     }
+
+    assert!(map_accum.is_empty());
+    let mut last_accum = vec_accum.pop().expect("last accumulator");
+    assert!(vec_accum.is_empty());
+    let pyval = last_accum.pop().expect("last json");
+    assert!(last_accum.is_empty());
+    pyval
 }
 
 #[cfg(test)]
@@ -385,5 +435,35 @@ mod tests {
         assert_eq!(err.ptype, TypeError::type_object(py).into_object());
         assert_eq!(err.pvalue.unwrap().to_string(), "keys must be a string");
         assert_eq!(err.ptraceback, None);
+    }
+
+    #[test]
+    fn no_stack_smash_from_json_object() {
+        let mut v = serde_json::Value::Object(serde_json::Map::new());
+        for _ in 0..1000000 {
+            let mut new_v = serde_json::Value::Object(serde_json::Map::new());
+            ::std::mem::swap(&mut v, &mut new_v);
+            v.as_object_mut().unwrap().insert("".to_string(), new_v);
+        }
+
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        from_json(py, v).unwrap();
+    }
+
+    #[test]
+    fn no_stack_smash_from_json_array() {
+        let mut v = serde_json::Value::Array(Vec::new());
+        for _ in 0..1000000 {
+            let mut new_v = serde_json::Value::Array(Vec::new());
+            ::std::mem::swap(&mut v, &mut new_v);
+            v.as_array_mut().unwrap().push(new_v);
+        }
+
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        from_json(py, v).unwrap();
     }
 }
